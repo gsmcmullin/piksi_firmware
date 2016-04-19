@@ -127,7 +127,8 @@ static void interface_function(tracker_channel_t *tracker_channel,
                                tracker_interface_function_t func);
 static void event(tracker_channel_t *d, event_t event);
 static void common_data_init(tracker_common_data_t *common_data,
-                             u32 sample_count, float carrier_freq, float cn0);
+                             u32 sample_count, float carrier_freq,
+                             float cn0, code_t code);
 static void tracker_channel_lock(tracker_channel_t *tracker_channel);
 static void tracker_channel_unlock(tracker_channel_t *tracker_channel);
 static void error_flags_clear(tracker_channel_t *tracker_channel);
@@ -280,16 +281,19 @@ bool tracker_channel_available(tracker_channel_id_t id, gnss_signal_t sid)
  * \param carrier_freq Current carrier frequency (i.e. Doppler) in Hz used for
  *                     carrier aiding.
  * \param n_samples    N, the number of samples to propagate for.
+ * \param code         Signal code
  *
  * \return The propagated code phase in chips.
  */
-double propagate_code_phase(double code_phase, double carrier_freq, u32 n_samples)
+double propagate_code_phase(double code_phase, double carrier_freq,
+                            u32 n_samples, code_t code)
 {
   /* Calculate the code phase rate with carrier aiding. */
-  double code_phase_rate = (1.0 + carrier_freq/GPS_L1_HZ) * GPS_CA_CHIPPING_RATE;
+  double code_phase_rate = (1.0 + carrier_freq / code_to_carr_freq(code)) *
+                           GPS_CA_CHIPPING_RATE;
   code_phase += n_samples * code_phase_rate / SAMPLE_FREQ;
   u32 cp_int = floor(code_phase);
-  code_phase -= cp_int - (cp_int % 1023);
+  code_phase -= cp_int - (cp_int % code_to_chip_num(code));
   return code_phase;
 }
 
@@ -336,7 +340,8 @@ bool tracker_channel_init(tracker_channel_id_t id, gnss_signal_t sid,
     /* TODO : change hardcoded sample rate */
 
     common_data_init(&tracker_channel->common_data, ref_sample_count,
-                     carrier_freq, cn0_init);
+                     carrier_freq, cn0_init, sid.code);
+
     internal_data_init(&tracker_channel->internal_data, sid);
     interface_function(tracker_channel, tracker_interface->init);
 
@@ -981,9 +986,11 @@ static void event(tracker_channel_t *tracker_channel, event_t event)
  * \param sample_count      Sample count.
  * \param carrier_freq      Carrier frequency.
  * \param cn0               C/N0 estimate.
+ * \param code              Code identifier.
  */
 static void common_data_init(tracker_common_data_t *common_data,
-                             u32 sample_count, float carrier_freq, float cn0)
+                             u32 sample_count, float carrier_freq,
+                             float cn0, code_t code)
 {
   /* Initialize all fields to 0 */
   memset(common_data, 0, sizeof(tracker_common_data_t));
@@ -991,8 +998,8 @@ static void common_data_init(tracker_common_data_t *common_data,
   common_data->TOW_ms = TOW_INVALID;
 
   /* Calculate code phase rate with carrier aiding. */
-  common_data->code_phase_rate = (1 + carrier_freq/GPS_L1_HZ) *
-                                    GPS_CA_CHIPPING_RATE;
+  common_data->code_phase_rate = (1 + carrier_freq / code_to_carr_freq(code)) *
+                                 GPS_CA_CHIPPING_RATE;
   common_data->carrier_freq = carrier_freq;
 
   common_data->sample_count = sample_count;

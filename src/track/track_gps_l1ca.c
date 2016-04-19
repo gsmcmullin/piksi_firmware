@@ -11,7 +11,10 @@
  */
 
 #include "track_gps_l1ca.h"
+#include "track_gps_l2cm.h" /* for L1C/A to L2 CM tracking handover */
 #include "track_api.h"
+#include "track.h"
+#include "decode.h"
 
 #include <libswiftnav/constants.h>
 #include <libswiftnav/logging.h>
@@ -337,6 +340,9 @@ static void tracker_gps_l1ca_update(const tracker_channel_info_t *channel_info,
 
     /* Indicate that a mode change has occurred. */
     common_data->mode_change_count = common_data->update_count;
+
+    do_l1ca_to_l2cm_handover(channel_info->sid.sat, channel_info->nap_channel,
+                             common_data->code_phase_early);
   }
 
   tracker_retune(channel_info->context, common_data->carrier_freq,

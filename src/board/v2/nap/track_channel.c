@@ -78,7 +78,7 @@ void nap_track_init(u8 channel, gnss_signal_t sid, u32 ref_timing_count,
 
   u32 track_count = nap_timing_count() + 20000;
   float cp = propagate_code_phase(code_phase, carrier_freq,
-                                  track_count - ref_timing_count);
+                                  track_count - ref_timing_count, sid.code);
 
   /* Contrive for the timing strobe to occur at or close to a
    * PRN edge (code phase = 0) */
