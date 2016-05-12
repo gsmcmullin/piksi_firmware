@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2011-2014 Swift Navigation Inc.
+ * Copyright (C) 2011-2014,2016 Swift Navigation Inc.
  * Contact: Fergus Noble <fergus@swift-nav.com>
  *
  * This source is subject to the license found in the file 'LICENSE' which must
@@ -25,6 +25,7 @@
 #include <libswiftnav/coord_system.h>
 #include <libswiftnav/linear_algebra.h>
 #include <libswiftnav/signal.h>
+#include <libswiftnav/constants.h>
 
 #include "main.h"
 #include "board/nap/track_channel.h"
@@ -123,7 +124,6 @@ static void acq_result_send(gnss_signal_t sid, float snr, float cp, float cf);
 static u8 manage_track_new_acq(gnss_signal_t sid);
 static void manage_acq(void);
 static void manage_track(void);
-static void nmea_send(void);
 
 static void manage_tracking_startup(void);
 static void tracking_startup_fifo_init(tracking_startup_fifo_t *fifo);
@@ -162,7 +162,7 @@ static void mask_sat_callback(u16 sender_id, u8 len, u8 msg[], void* context)
   }
 }
 
-static WORKING_AREA_CCM(wa_manage_acq_thread, MANAGE_ACQ_THREAD_STACK);
+static WORKING_AREA_BCKP(wa_manage_acq_thread, MANAGE_ACQ_THREAD_STACK);
 static void manage_acq_thread(void *arg)
 {
   /* TODO: This should be trigged by a semaphore from the acq ISR code, not
@@ -192,6 +192,13 @@ void manage_acq_setup()
 
     track_mask[i] = false;
     almanac[i].valid = 0;
+
+    if (CODE_GPS_L2CM == acq_status[i].sid.code) {
+      /* Do not acquire GPS L2C.
+       * Do GPS L1 C/A to L2C handover at the tracking stage instead. */
+      acq_status[i].state = ACQ_PRN_SKIP;
+      acq_status[i].masked = true;
+    }
 
     if (!sbas_enabled &&
         (sid_to_constellation(acq_status[i].sid) == CONSTELLATION_SBAS)) {
@@ -260,8 +267,9 @@ static u16 manage_warm_start(gnss_signal_t sid, const gps_time_t* t,
       /* sat_pos now holds unit vector from us to satellite */
       vector_subtract(3, sat_vel, position_solution.vel_ecef, sat_vel);
       /* sat_vel now holds velocity of sat relative to us */
-      dopp_hint = -GPS_L1_HZ * (vector_dot(3, sat_pos, sat_vel) / GPS_C
-                                + position_solution.clock_bias);
+      dopp_hint = -code_to_carr_freq(sid.code) *
+                  (vector_dot(3, sat_pos, sat_vel) / GPS_C
+                   + position_solution.clock_bias);
       /* TODO: Check sign of receiver frequency offset correction */
       if (time_quality >= TIME_FINE)
         dopp_uncertainty = DOPP_UNCERT_EPHEM;
@@ -394,6 +402,7 @@ static void manage_acq()
       .sample_count = acq_result.sample_count,
       .carrier_freq = acq_result.cf,
       .code_phase = acq_result.cp,
+      .chips_to_correlate = GPS_L1CA_CHIPS_NUM,
       .cn0_init = acq_result.cn0,
       .elevation = TRACKING_ELEVATION_UNKNOWN
     };
@@ -434,7 +443,9 @@ static u8 manage_track_new_acq(gnss_signal_t sid)
    */
   for (u8 i=0; i<nap_track_n_channels; i++) {
     if (tracker_channel_available(i, sid) &&
-        decoder_channel_available(i, sid)) {
+        /** \todo: the (sid.code == 1) part is to be removed once L2C
+                   data decoding channel support is added */
+        (decoder_channel_available(i, sid) || (sid.code == 1))) {
       return i;
     }
   }
@@ -459,7 +470,7 @@ static void check_clear_unhealthy(void)
   }
 }
 
-static WORKING_AREA_CCM(wa_manage_track_thread, MANAGE_TRACK_THREAD_STACK);
+static WORKING_AREA_BCKP(wa_manage_track_thread, MANAGE_TRACK_THREAD_STACK);
 static void manage_track_thread(void *arg)
 {
   (void)arg;
@@ -469,7 +480,6 @@ static void manage_track_thread(void *arg)
     DO_EVERY(2,
       check_clear_unhealthy();
       manage_track();
-      nmea_send();
       watchdog_notify(WD_NOTIFY_TRACKING_MGMT);
     );
     tracking_send_state();
@@ -583,23 +593,6 @@ static void manage_track()
   }
 }
 
-static void nmea_send(void)
-{
-  /* Assemble list of currently tracked GPS PRNs */
-  u8 prns[nap_track_n_channels];
-  u8 num_prns = 0;
-  for (u32 i=0; i<nap_track_n_channels; i++) {
-    if (tracking_channel_running(i)) {
-      gnss_signal_t sid = tracking_channel_sid_get(i);
-      if (sid_to_constellation(sid) == CONSTELLATION_GPS) {
-        prns[num_prns++] = sid.sat;
-      }
-    }
-  }
-  /* Send GPGSA message */
-  nmea_gpgsa(prns, num_prns, 0);
-}
-
 s8 use_tracking_channel(u8 i)
 {
   /* To use a channel's measurements in an SPP or RTK solution, we
@@ -702,6 +695,7 @@ static void manage_tracking_startup(void)
                              startup_params.sample_count,
                              startup_params.code_phase,
                              startup_params.carrier_freq,
+                             startup_params.chips_to_correlate,
                              startup_params.cn0_init,
                              TRACKING_ELEVATION_UNKNOWN)) {
       log_error("tracker channel init failed");

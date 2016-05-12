@@ -35,8 +35,6 @@ typedef enum {
 
 #define MAX_AGE_OF_DIFFERENTIAL 1.0
 
-#define DGNSS_TIMEOUT S2ST(2)
-
 #define OBS_N_BUFF 5
 #define OBS_BUFF_SIZE (OBS_N_BUFF * sizeof(obss_t))
 
@@ -49,7 +47,8 @@ void solution_send_nmea(gnss_solution *soln, dops_t *dops,
                         u8 fix_type);
 double calc_heading(const double b_ned[3]);
 void solution_send_baseline(const gps_time_t *t, u8 n_sats, double b_ecef[3],
-                            double ref_ecef[3], u8 flags);
+                            double ref_ecef[3], u8 flags, double hdop, 
+                            double corrections_age, u16 sender_id);
 void solution_setup(void);
 
 #endif

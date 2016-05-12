@@ -43,6 +43,16 @@
 #include "system_monitor.h"
 #include "main.h"
 
+/* Maximum CPU time the solution thread is allowed to use. */
+#define SOLN_THD_CPU_MAX (0.60f)
+
+/** number of solution periods before SPP resumes in pseudo-absolute mode */
+#define DGNSS_TIMEOUT_PERIODS 2
+
+/** number of OS ticks before SPP resumes in pseudo-absolute mode */
+#define DGNSS_TIMEOUT(soln_freq_hz) MS2ST((DGNSS_TIMEOUT_PERIODS * \
+  1/((float) (soln_freq_hz)) * 1000))
+
 MemoryPool obs_buff_pool;
 mailbox_t obs_mailbox;
 
@@ -74,7 +84,7 @@ void solution_send_sbp(gnss_solution *soln, dops_t *dops)
     msg_gps_time_t gps_time;
     sbp_make_gps_time(&gps_time, &soln->time, 0);
     sbp_send_msg(SBP_MSG_GPS_TIME, sizeof(gps_time), (u8 *) &gps_time);
-    if (chVTTimeElapsedSinceX(last_dgnss) > DGNSS_TIMEOUT) {
+    if (chVTTimeElapsedSinceX(last_dgnss) > DGNSS_TIMEOUT(soln_freq)) {
       /* Position in LLH. */
       msg_pos_llh_t pos_llh;
       sbp_make_pos_llh(&pos_llh, soln, 0);
@@ -108,11 +118,11 @@ void solution_send_nmea(gnss_solution *soln, dops_t *dops,
                         u8 n, navigation_measurement_t *nm,
                         u8 fix_mode)
 {
-  if (chVTTimeElapsedSinceX(last_dgnss) > DGNSS_TIMEOUT) {
+  if (chVTTimeElapsedSinceX(last_dgnss) > DGNSS_TIMEOUT(soln_freq)) {
     nmea_gpgga(soln->pos_llh, &soln->time, soln->n_used,
-               fix_mode, dops->hdop);
+               fix_mode, dops->hdop, 0, 0);
   }
-  nmea_send_msgs(soln, n, nm);
+  nmea_send_msgs(soln, n, nm, dops);
 
 }
 
@@ -143,7 +153,8 @@ double calc_heading(const double b_ned[3])
  * \param flags u8 RTK solution flags. 1 if float, 0 if fixed
  */
 void solution_send_baseline(const gps_time_t *t, u8 n_sats, double b_ecef[3],
-                            double ref_ecef[3], u8 flags)
+                            double ref_ecef[3], u8 flags, double hdop, 
+                            double corrections_age, u16 sender_id)
 {
   double* base_station_pos;
   msg_baseline_ecef_t sbp_ecef;
@@ -183,7 +194,7 @@ void solution_send_baseline(const gps_time_t *t, u8 n_sats, double b_ecef[3],
     wgsecef2llh(pseudo_absolute_ecef, pseudo_absolute_llh);
     u8 fix_mode = (flags & 1) ? NMEA_GGA_FIX_RTK : NMEA_GGA_FIX_FLOAT;
     /* TODO: Don't fake DOP!! */
-    nmea_gpgga(pseudo_absolute_llh, t, n_sats, fix_mode, 1.5);
+    nmea_gpgga(pseudo_absolute_llh, t, n_sats, fix_mode, hdop, corrections_age, sender_id);
     /* now send pseudo absolute sbp message */
     /* Flag in message is defined as follows :float->2, fixed->1 */
     /* We defined the flags for the SBP protocol to be spp->0, fixed->1, float->2 */
@@ -200,7 +211,7 @@ void solution_send_baseline(const gps_time_t *t, u8 n_sats, double b_ecef[3],
 }
 
 static void output_baseline(u8 num_sdiffs, const sdiff_t *sdiffs,
-                            const gps_time_t *t)
+                            const gps_time_t *t, double hdop, double diff_time, u16 base_id)
 {
   double b[3];
   u8 num_used, flags;
@@ -239,7 +250,7 @@ static void output_baseline(u8 num_sdiffs, const sdiff_t *sdiffs,
     break;
   }
 
-  solution_send_baseline(t, num_used, b, position_solution.pos_ecef, flags);
+  solution_send_baseline(t, num_used, b, position_solution.pos_ecef, flags, hdop, diff_time, base_id);
 }
 
 void send_observations(u8 n, gps_time_t *t, navigation_measurement_t *m)
@@ -319,7 +330,7 @@ static void solution_simulation()
     solution_send_baseline(&(soln->time),
       simulation_current_num_sats(),
       simulation_current_baseline_ecef(),
-      simulation_ref_ecef(), flags);
+      simulation_ref_ecef(), flags, 1.5, 0.25, 1023);
 
     double t_check = expected_tow * (soln_freq / obs_output_divisor);
     if (fabs(t_check - (u32)t_check) < TIME_MATCH_THRESHOLD) {
@@ -344,22 +355,41 @@ static void update_sat_elevations(const navigation_measurement_t nav_meas[],
   }
 }
 
-bool chThdSleepUntilCheck(systime_t time)
+/** Sleep until the next solution deadline.
+ *
+ * \param deadline    Pointer to the current deadline, updated by this function.
+ * \param interval    Interval by which the deadline should be advanced.
+ */
+static void sol_thd_sleep(systime_t *deadline, systime_t interval)
 {
+  *deadline += interval;
+
   chSysLock();
-  systime_t systime = chVTGetSystemTimeX();
-  if (time > systime) {
-    chThdSleepS(time - systime);
-    chSysUnlock();
-  } else {
-    chSysUnlock();
-    if (time != systime) {
-      log_warn("Solution thread missed deadline, "
-               "time = %lu, deadline = %lu", systime, time);
-      return false;
+  while (1) {
+    /* Sleep for at least (1-SOLN_THD_CPU_MAX) * interval ticks so that
+     * execution time is limited to SOLN_THD_CPU_MAX. */
+    systime_t systime = chVTGetSystemTimeX();
+    systime_t delta = *deadline - systime;
+    systime_t sleep_min = (systime_t)ceilf((1.0f-SOLN_THD_CPU_MAX) * interval);
+    if ((systime_t)(delta - sleep_min) <= ((systime_t)-1) / 2) {
+      chThdSleepS(delta);
+      break;
+    } else {
+      chSysUnlock();
+      if (delta <= ((systime_t)-1) / 2) {
+        /* Deadline is in the future. Skipping due to high CPU usage. */
+        log_warn("Solution thread skipping deadline, "
+                  "time = %lu, deadline = %lu", systime, *deadline);
+      } else {
+        /* Deadline is in the past. */
+        log_warn("Solution thread missed deadline, "
+                 "time = %lu, deadline = %lu", systime, *deadline);
+      }
+      *deadline += interval;
+      chSysLock();
     }
   }
-  return true;
+  chSysUnlock();
 }
 
 static WORKING_AREA_CCM(wa_solution_thread, 8000);
@@ -372,10 +402,8 @@ static void solution_thread(void *arg)
   static navigation_measurement_t nav_meas_old[MAX_CHANNELS];
 
   while (TRUE) {
-    do {
-      deadline += (CH_CFG_ST_FREQUENCY/soln_freq);
-    } while (!chThdSleepUntilCheck(deadline));
 
+    sol_thd_sleep(&deadline, CH_CFG_ST_FREQUENCY/soln_freq);
     watchdog_notify(WD_NOTIFY_SOLUTION);
 
     /* Here we do all the nice simulation-related stuff. */
@@ -489,7 +517,8 @@ static void solution_thread(void *arg)
                                     sdiffs);
             ephemeris_unlock();
             if (num_sdiffs >= 4) {
-              output_baseline(num_sdiffs, sdiffs, &position_solution.time);
+              output_baseline(num_sdiffs, sdiffs, &position_solution.time, pdt, 
+                              dops.hdop, base_obss.sender_id);
             }
           }
 
@@ -513,7 +542,7 @@ static void solution_thread(void *arg)
         /* Propagate observation to desired time. */
         for (u8 i=0; i<n_ready_tdcp; i++) {
           nav_meas_tdcp[i].pseudorange -= t_err * nav_meas_tdcp[i].doppler *
-            (GPS_C / GPS_L1_HZ);
+            (GPS_C / code_to_carr_freq(nav_meas_tdcp[i].sid.code));
           nav_meas_tdcp[i].carrier_phase += t_err * nav_meas_tdcp[i].doppler;
         }
 
@@ -587,7 +616,7 @@ static bool init_done = false;
 static bool init_known_base = false;
 static bool reset_iar = false;
 
-void process_matched_obs(u8 n_sds, gps_time_t *t, sdiff_t *sds)
+void process_matched_obs(u8 n_sds, gps_time_t *t, sdiff_t *sds, u16 base_id)
 {
   if (init_known_base) {
     if (n_sds > 4) {
@@ -629,7 +658,7 @@ void process_matched_obs(u8 n_sds, gps_time_t *t, sdiff_t *sds)
      * for this observation. */
     if (dgnss_soln_mode == SOLN_MODE_TIME_MATCHED &&
         !simulation_enabled() && n_sds >= 4) {
-      output_baseline(n_sds, sds, t);
+      output_baseline(n_sds, sds, t, 0, 0, base_id);
     }
   }
 }
@@ -679,7 +708,7 @@ static void time_matched_obs_thread(void *arg)
            * our filters. */
           n_sds = filter_sdiffs(n_sds, sds, num_sats_to_drop, sats_to_drop);
         }
-        process_matched_obs(n_sds, &obss->t, sds);
+        process_matched_obs(n_sds, &obss->t, sds, base_obss.sender_id);
         chPoolFree(&obs_buff_pool, obss);
         break;
       } else {
@@ -749,8 +778,7 @@ void init_base_callback(u16 sender_id, u8 len, u8 msg[], void* context)
 void solution_setup()
 {
   /* Set time of last differential solution in the past. */
-  last_dgnss = chVTGetSystemTime() - DGNSS_TIMEOUT;
-
+  last_dgnss = chVTGetSystemTime() - DGNSS_TIMEOUT(soln_freq);
   SETTING("solution", "soln_freq", soln_freq, TYPE_FLOAT);
   SETTING("solution", "output_every_n_obs", obs_output_divisor, TYPE_INT);
 
